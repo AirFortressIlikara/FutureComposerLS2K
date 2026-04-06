@@ -1,8 +1,7 @@
-#include "RTE_Components.h"
-#include <arm_acle.h>
-#include CMSIS_device_header
+#include "main.h"
 #include "fc14synthesizer.hpp"
 #include "music_data.h"
+#include <cstdint>
 
 // Sigma embedded devs never needed a heap
 __asm(".global __use_no_heap\n");
@@ -10,23 +9,46 @@ __asm(".global __use_no_heap\n");
 #define ARRAY_SIZE(X) (sizeof(X)/sizeof((X)[0]))
 
 uint8_t audio_buffer[4096] = {0};
-uint8_t bufferHalfToFill = 1;
-uint8_t bufferNeedsFill = 0;
+volatile uint8_t bufferHalfToFill = 1;
+volatile uint8_t bufferNeedsFill = 0;
+
+DMA_HandleTypeDef hdma_tim_up;
+TIM_HandleTypeDef htim;
+UART_HandleTypeDef huart0;
 
 alignas(4) constexpr auto MusicData = Fc14ByteorderInversion<KEIL_KEYGEN_MUSIC_DATA>();
 FC14Synthesizer synthesizer(MusicData);
 
-void init_hardware();
+extern "C" void APB_DMA5_LIOINTC_IRQHandler();
+extern "C" void DMA_HalfCpltCallback(DMA_HandleTypeDef *hdma_tim_up);
+extern "C" void DMA_CpltCallback(DMA_HandleTypeDef *hdma_tim_up);
+static void DMA_Init(void);
+static void TIM_Init(void);
+static void UART_Init(void);
 
 int main() {
-    init_hardware();
+    HAL_Init();
+
+    /* Initialize all configured peripherals */
+    UART_Init();
+    DMA_Init();
+    TIM_Init();
+
+    HAL_DMA_RegisterCallback(&hdma_tim_up, HAL_DMA_XFER_HALFCPLT_CB_ID, DMA_HalfCpltCallback);
+    HAL_DMA_RegisterCallback(&hdma_tim_up, HAL_DMA_XFER_CPLT_CB_ID, DMA_CpltCallback);
 
     // Initial synthesis
     synthesizer.synthesize(audio_buffer, sizeof(audio_buffer));
 
     // Start DMA and Timer
-    DMA1_Channel5->CCR |= DMA_CCR5_EN;
-    TIM1->CR1 |= TIM_CR1_CEN;
+    HAL_DMA_Start_IT(&hdma_tim_up,
+                     (uint32_t)(uint64_t)audio_buffer,
+                     (uint32_t)(uint64_t)(&ATIM->CCR3),
+                     4096);
+    __HAL_TIM_ENABLE_DMA(&htim, TIM_DMA_UPDATE);
+    __HAL_TIM_MOE_ENABLE(&htim);
+    TIM_CCxChannelCmd(htim.Instance, TIM_CHANNEL_3, TIM_CCxN_ENABLE);
+    HAL_TIM_Base_Start(&htim);
 
     while (1) {
         if (bufferNeedsFill) {
@@ -37,62 +59,121 @@ int main() {
     }
 }
 
-void init_hardware() {
-    // We use TIM1 @ 72MHz, sample rate @ 28125 Hz
-    // ARR = 0xFF (Uses full 8-bit values)
-    // PSC = 0
-    // Compare cycle = 72M / (PSC)1 / (ARR)256 / (RCR)10 = 28125 Hz, Repetition = 10, RCR = 9
-    RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
-    TIM1->CR1 = TIM_CR1_URS; // DIR = 0: Up counter; URS: update event on overflow only
-    TIM1->CR2 = 0; // Features unused
-    TIM1->SMCR = 0; // Slave mode unused
-    TIM1->DIER = TIM_DIER_UDE; // DMARQ on update event
-    TIM1->CCMR1 = TIM_CCMR1_OC1M_0 | TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2; // OC1M=111 PWM Mode 2
-    TIM1->CCER = TIM_CCER_CC1E; // Enable Capture/Compare Channel 1
-    TIM1->CNT = 0; // Reset value
-    TIM1->PSC = 0;
-    TIM1->ARR = 0xFF;
-    TIM1->RCR = 9;
-    TIM1->DCR = TIM_DCR_DBL_0 | TIM_DCR_DBA_4; // Offset 16 = CCR1, Burst length = 1
-    TIM1->BDTR = TIM_BDTR_MOE; // Enable master output switch
-
-    // GPIO
-    // TIM1 CH1 PA8
-    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_AFIOEN; // Enable GPIOA and AFIO
-    GPIOA->CRH = GPIO_CRH_CNF8_1 | GPIO_CRH_MODE8; // PA8 AF-PP, 50MHz
-
-    // DMA
-    // Use DMA1 CH5
-    RCC->AHBENR |= RCC_AHBENR_DMA1EN;
-    __nop(); __nop(); __nop(); __nop(); __nop(); __nop(); __nop();
-    DMA1_Channel5->CCR = DMA_CCR5_CIRC | DMA_CCR5_MINC | DMA_CCR5_PSIZE_0 |
-                         DMA_CCR5_DIR | DMA_CCR5_HTIE | DMA_CCR5_TCIE;
-                         // CIRC: circular buffer;
-                         // MINC: increment on memory side;
-                         // PSIZE=1 MSIZE=0: 16bit on periph, 8 bits on mem
-                         // DIR: Memory to Peripheral
-                         // HTIE: Half complete interrupt enabled
-                         // TCIE: Transfer complete interrupt enabled
-    DMA1_Channel5->CNDTR = 4096;
-    DMA1_Channel5->CPAR = uint32_t(&TIM1->CCR1);
-    DMA1_Channel5->CMAR = uint32_t(&audio_buffer);
-
-    NVIC_EnableIRQ(DMA1_Channel5_IRQn);
+/**
+  * @brief UART0 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void UART_Init(void)
+{
+  huart0.Instance = UART0;
+  huart0.Init.BaudRate = 115200;
+  huart0.Init.WordLength = UART_WORDLENGTH_8B;
+  huart0.Init.StopBits = UART_STOPBITS_1;
+  huart0.Init.Parity = UART_PARITY_NONE;
+  if (HAL_UART_Init(&huart0) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
-extern "C" void DMA1_Channel5_IRQHandler() {
-    if (DMA1->ISR & DMA_ISR_HTIF5) {
-        // DMA1 CH5 Half complete
-        bufferHalfToFill = bufferHalfToFill ? 0 : 1; // Flip to another half of buffer
-        bufferNeedsFill = 1;
-        DMA1->IFCR = DMA_IFCR_CHTIF5;
-        NVIC_ClearPendingIRQ(DMA1_Channel5_IRQn);
-    } else if (DMA1->ISR & DMA_ISR_TCIF5) {
-        // DMA1 CH5 Transfer complete
-        bufferHalfToFill = bufferHalfToFill ? 0 : 1; // Flip to another half of buffer
-        bufferNeedsFill = 1;
-        DMA1->IFCR = DMA_IFCR_CTCIF5;
-        NVIC_ClearPendingIRQ(DMA1_Channel5_IRQn);
+/**
+  * @brief TIM Initialization Function
+  * @param None
+  * @retval None
+  */
+static void TIM_Init(void)
+{
+    // We use ATIM @ 200MHz, sample rate @ 41118 Hz
+    // ARR = 0xFF (Uses full 8-bit values)
+    // PSC = 19
+    // Compare cycle = 200M / (PSC)19 / (ARR)256 / (RCR)1 = 41118 Hz, Repetition = 1, RCR = 0
+    TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+    TIM_MasterConfigTypeDef sMasterConfig = {0};
+    TIM_OC_InitTypeDef sConfigOC = {0};
+    TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+    htim.Instance = ATIM;
+    htim.Init.Prescaler = 18;
+    htim.Init.Period = 0xFF;
+    htim.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim.Init.RepetitionCounter = 0;
+    htim.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_Base_Init(&htim) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+    if (HAL_TIM_ConfigClockSource(&htim, &sClockSourceConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    if (HAL_TIM_PWM_Init(&htim) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim, &sMasterConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sConfigOC.OCMode = TIM_OCMODE_PWM2;
+    sConfigOC.Pulse = 0;
+    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+    sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+    sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+    if (HAL_TIM_PWM_ConfigChannel(&htim, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+    sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+    sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+    sBreakDeadTimeConfig.DeadTime = 0;
+    sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+    sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+    sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+    if (HAL_TIMEx_ConfigBreakDeadTime(&htim, &sBreakDeadTimeConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void DMA_Init() {
+    /* DMA interrupt init */
+    /* APB_DMA2_LIOINTC_IRQn interrupt configuration */
+    HAL_LIOINTC_Init(APB_DMA5_LIOINTC_IRQn / 32);
+    HAL_LIOINTC_Config(APB_DMA5_LIOINTC_IRQn, LIOINTC_IRQ_TYPE_HIGH);
+    HAL_LIOINTC_RegisterCallback(APB_DMA5_LIOINTC_IRQn, APB_DMA5_LIOINTC_IRQHandler);
+    HAL_LIOINTC_Enable(APB_DMA5_LIOINTC_IRQn);
+}
+
+extern "C" void APB_DMA5_LIOINTC_IRQHandler() {
+	HAL_DMA_IRQHandler(&hdma_tim_up);
+}
+
+extern "C" void DMA_HalfCpltCallback(DMA_HandleTypeDef *hdma_tim_up) {
+    bufferHalfToFill = bufferHalfToFill ? 0 : 1; // Flip to another half of buffer
+    bufferNeedsFill = 1;
+}
+
+extern "C" void DMA_CpltCallback(DMA_HandleTypeDef *hdma_tim_up) {
+    bufferHalfToFill = bufferHalfToFill ? 0 : 1; // Flip to another half of buffer
+    bufferNeedsFill = 1;
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1)
+    {
     }
 }
 

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <cstdint>
 #include <algorithm>
 
 // https://ctrpeach.io/posts/cpp20-string-literal-template-parameters/

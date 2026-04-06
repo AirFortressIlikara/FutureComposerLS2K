@@ -84,3 +84,5 @@ uv2csolution.log
 # Ozone project file
 *.jdebug*
 
+.cache
+build

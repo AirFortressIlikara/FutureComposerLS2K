@@ -69,7 +69,7 @@ public:
         
         decoder.init((void*)(m_transformedFc14.data()), m_transformedFc14.size());
         decoder.setMixer(&mixer);
-        mixer.init(28125, 8, 1, 0);
+        mixer.init(41118, 8, 1, 0);
         decoder.restart();
     }
 
